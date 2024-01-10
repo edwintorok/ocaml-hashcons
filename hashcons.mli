@@ -59,9 +59,6 @@ val hashcons : 'a t -> 'a -> 'a hash_consed
       As a consequence the returned value is physically equal to
       any equal value already hash-consed using table [t]. *)
 
-val iter : ('a hash_consed -> unit) -> 'a t -> unit
-  (** [iter f t] iterates [f] over all elements of [t]. *)
-
 val stats : 'a t -> int * int * int * int * int * int
   (** Return statistics on the table.  The numbers are, in order:
       table length, number of entries, sum of bucket lengths,

@@ -34,7 +34,19 @@ let lam s t = H.hashcons ht (Lam (s,t))
 
 let x = var "x"
 let delta = lam "x" (app x x)
-let omega = app delta delta
+let _omega = app delta delta
+
+let () = assert (var "x" == x)
+let () = assert (app x x == app x x)
+
+let ht = create 17
+let var s = hashcons ht (Var s)
+let app t1 t2 = hashcons ht (App (t1,t2))
+let lam s t = hashcons ht (Lam (s,t))
+
+let x = var "x"
+let delta = lam "x" (app x x)
+let _omega = app delta delta
 
 let () = assert (var "x" == x)
 let () = assert (app x x == app x x)

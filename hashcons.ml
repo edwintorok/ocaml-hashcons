@@ -21,121 +21,6 @@ type +'a hash_consed = {
   tag : int;
   node : 'a }
 
-let gentag =
-  let r = ref 0 in
-  fun () -> incr r; !r
-
-type 'a t = {
-  mutable table : 'a hash_consed Weak.t array;
-  mutable totsize : int;             (* sum of the bucket sizes *)
-  mutable limit : int;               (* max ratio totsize/table length *)
-}
-
-let create sz =
-  let sz = if sz < 7 then 7 else sz in
-  let sz = if sz > Sys.max_array_length then Sys.max_array_length else sz in
-  let emptybucket = Weak.create 0 in
-  { table = Array.make sz emptybucket;
-    totsize = 0;
-    limit = 3; }
-
-let clear t =
-  let emptybucket = Weak.create 0 in
-  for i = 0 to Array.length t.table - 1 do t.table.(i) <- emptybucket done;
-  t.totsize <- 0;
-  t.limit <- 3
-
-let fold f t init =
-  let rec fold_bucket i b accu =
-    if i >= Weak.length b then accu else
-      match Weak.get b i with
-	| Some v -> fold_bucket (i+1) b (f v accu)
-	| None -> fold_bucket (i+1) b accu
-  in
-  Array.fold_right (fold_bucket 0) t.table init
-
-let iter f t =
-  let rec iter_bucket i b =
-    if i >= Weak.length b then () else
-      match Weak.get b i with
-	| Some v -> f v; iter_bucket (i+1) b
-	| None -> iter_bucket (i+1) b
-  in
-  Array.iter (iter_bucket 0) t.table
-
-let count t =
-  let rec count_bucket i b accu =
-    if i >= Weak.length b then accu else
-      count_bucket (i+1) b (accu + (if Weak.check b i then 1 else 0))
-  in
-  Array.fold_right (count_bucket 0) t.table 0
-
-let next_sz n = min (3*n/2 + 3) (Sys.max_array_length - 1)
-
-let rec resize t =
-  let oldlen = Array.length t.table in
-  let newlen = next_sz oldlen in
-  if newlen > oldlen then begin
-    let newt = create newlen in
-    newt.limit <- t.limit + 100;          (* prevent resizing of newt *)
-    fold (fun d () -> add newt d) t ();
-    t.table <- newt.table;
-    t.limit <- t.limit + 2;
-  end
-
-and add t d =
-  let index = d.hkey mod (Array.length t.table) in
-  let bucket = t.table.(index) in
-  let sz = Weak.length bucket in
-  let rec loop i =
-    if i >= sz then begin
-      let newsz = min (sz + 3) (Sys.max_array_length - 1) in
-      if newsz <= sz then
-	failwith "Hashcons.Make: hash bucket cannot grow more";
-      let newbucket = Weak.create newsz in
-      Weak.blit bucket 0 newbucket 0 sz;
-      Weak.set newbucket i (Some d);
-      t.table.(index) <- newbucket;
-      t.totsize <- t.totsize + (newsz - sz);
-      if t.totsize > t.limit * Array.length t.table then resize t;
-    end else begin
-      if Weak.check bucket i
-      then loop (i+1)
-      else Weak.set bucket i (Some d)
-    end
-  in
-  loop 0
-
-let hashcons t d =
-  let hkey = Hashtbl.hash d land max_int in
-  let index = hkey mod (Array.length t.table) in
-  let bucket = t.table.(index) in
-  let sz = Weak.length bucket in
-  let rec loop i =
-    if i >= sz then begin
-      let hnode = { hkey = hkey; tag = gentag (); node = d } in
-      add t hnode;
-      hnode
-    end else begin
-      match Weak.get_copy bucket i with
-        | Some v when v.node = d ->
-	    begin match Weak.get bucket i with
-              | Some v -> v
-              | None -> loop (i+1)
-            end
-        | _ -> loop (i+1)
-    end
-  in
-  loop 0
-
-let stats t =
-  let len = Array.length t.table in
-  let lens = Array.map Weak.length t.table in
-  Array.sort compare lens;
-  let totlen = Array.fold_left ( + ) 0 lens in
-  (len, count t, totlen, lens.(0), lens.(len/2), lens.(len-1))
-
-
 (* Functorial interface *)
 
 module type HashedType =
@@ -156,128 +41,57 @@ module type S =
     val stats : t -> int * int * int * int * int * int
   end
 
+(* Uniqueness only guaranteed for values hashconsed to same table,
+   and a hash table can only be used from a single thread at a time.
+   Race conditions from multiple domains may result in duplicate tags,
+   but in different tables.     
+ *)
+let next_tag = ref 0
+
+module Node = struct
+  type t = Any: { node: _; hkey: int } -> t
+  let equal (a:t) (b:t) = a = b
+  let hash (Any t) = t.hkey
+end
+module E = Ephemeron.K1.Make(Node)
+
+type 'a t = 'a hash_consed E.t
+
+let create = E.create
+let clear = E.clear
+let stats t =
+  let s = E.stats t in
+  let alive = E.stats_alive t in
+  let lens = s.bucket_histogram in
+  let len = s.num_buckets in
+  (len, s.num_bindings, alive.num_bindings,lens.(0),lens.(len/2),lens.(len-1))
+
+let hashcons t node =
+    let hkey = Hashtbl.hash node in
+    let key = Node.Any { node; hkey } in
+    try E.find t key
+    with Not_found ->
+      let result = { node; hkey; tag = !next_tag } in
+      incr next_tag;
+      E.add t key result;
+      result
+
 module Make(H : HashedType) : (S with type key = H.t) = struct
 
   type key = H.t
 
-  type data = H.t hash_consed
+  include Weak.Make(struct
+    type t = H.t hash_consed
+    let equal a b = H.equal a.node b.node
+    let hash t = t.hkey
+  end)
 
-  type t = {
-    mutable table : data Weak.t array;
-    mutable totsize : int;             (* sum of the bucket sizes *)
-    mutable limit : int;               (* max ratio totsize/table length *)
-  }
-
-  let emptybucket = Weak.create 0
-
-  let create sz =
-    let sz = if sz < 7 then 7 else sz in
-    let sz = if sz > Sys.max_array_length then Sys.max_array_length else sz in
-    {
-      table = Array.make sz emptybucket;
-      totsize = 0;
-      limit = 3;
-    }
-
-  let clear t =
-    for i = 0 to Array.length t.table - 1 do
-      t.table.(i) <- emptybucket
-    done;
-    t.totsize <- 0;
-    t.limit <- 3
-
-  let fold f t init =
-    let rec fold_bucket i b accu =
-      if i >= Weak.length b then accu else
-      match Weak.get b i with
-      | Some v -> fold_bucket (i+1) b (f v accu)
-      | None -> fold_bucket (i+1) b accu
-    in
-    Array.fold_right (fold_bucket 0) t.table init
-
-  let iter f t =
-    let rec iter_bucket i b =
-      if i >= Weak.length b then () else
-      match Weak.get b i with
-      | Some v -> f v; iter_bucket (i+1) b
-      | None -> iter_bucket (i+1) b
-    in
-    Array.iter (iter_bucket 0) t.table
-
-  let count t =
-    let rec count_bucket i b accu =
-      if i >= Weak.length b then accu else
-      count_bucket (i+1) b (accu + (if Weak.check b i then 1 else 0))
-    in
-    Array.fold_right (count_bucket 0) t.table 0
-
-  let next_sz n = min (3*n/2 + 3) (Sys.max_array_length - 1)
-
-  let rec resize t =
-    let oldlen = Array.length t.table in
-    let newlen = next_sz oldlen in
-    if newlen > oldlen then begin
-      let newt = create newlen in
-      newt.limit <- t.limit + 100;          (* prevent resizing of newt *)
-      fold (fun d () -> add newt d) t ();
-      t.table <- newt.table;
-      t.limit <- t.limit + 2;
-    end
-
-  and add t d =
-    let index = d.hkey mod (Array.length t.table) in
-    let bucket = t.table.(index) in
-    let sz = Weak.length bucket in
-    let rec loop i =
-      if i >= sz then begin
-        let newsz = min (sz + 3) (Sys.max_array_length - 1) in
-        if newsz <= sz then
-	  failwith "Hashcons.Make: hash bucket cannot grow more";
-        let newbucket = Weak.create newsz in
-        Weak.blit bucket 0 newbucket 0 sz;
-        Weak.set newbucket i (Some d);
-        t.table.(index) <- newbucket;
-        t.totsize <- t.totsize + (newsz - sz);
-        if t.totsize > t.limit * Array.length t.table then resize t;
-      end else begin
-        if Weak.check bucket i
-        then loop (i+1)
-        else Weak.set bucket i (Some d)
-      end
-    in
-    loop 0
-
-  let hashcons t d =
-    let hkey = H.hash d land max_int in
-    let index = hkey mod (Array.length t.table) in
-    let bucket = t.table.(index) in
-    let sz = Weak.length bucket in
-    let rec loop i =
-      if i >= sz then begin
-	let hnode = { hkey = hkey; tag = gentag (); node = d } in
-	add t hnode;
-	hnode
-      end else begin
-        match Weak.get_copy bucket i with
-        | Some v when H.equal v.node d ->
-	    begin match Weak.get bucket i with
-              | Some v -> v
-              | None -> loop (i+1)
-            end
-        | _ -> loop (i+1)
-      end
-    in
-    loop 0
-
-  let stats t =
-    let len = Array.length t.table in
-    let lens = Array.map Weak.length t.table in
-    Array.sort compare lens;
-    let totlen = Array.fold_left ( + ) 0 lens in
-    (len, count t, totlen, lens.(0), lens.(len/2), lens.(len-1))
-
+  let hashcons t node =
+    let key = { node; hkey = H.hash node; tag = !next_tag } in
+    let result = merge t key in
+    if result == key then incr next_tag;
+    result
 end
-
 
 (*s When comparing branching bits, one has to be careful with the sign bit *)
 let unsigned_lt n m = n >= 0 && (m < 0 || n < m)
